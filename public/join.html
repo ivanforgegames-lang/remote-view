@@ -152,12 +152,46 @@
     }
   }
 
-  // Проверка параметров
+  // ── Логгер: отправляет события на сервер ──────────────
+  function clog(level, message, data = {}) {
+    console.log(`[${level}] ${message}`, data);
+    fetch('/api/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level, roomId, message, data })
+    }).catch(() => {});
+  }
+
+  // ── Детектор чёрного экрана ─────────────────────────────
+  let blackScreenTimer = null;
+  function startBlackScreenDetector() {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = 16; canvas.height = 16;
+
+    blackScreenTimer = setInterval(() => {
+      if (video.readyState < 2 || video.paused) return;
+      ctx.drawImage(video, 0, 0, 16, 16);
+      const px = ctx.getImageData(0, 0, 16, 16).data;
+      const avg = px.reduce((s, v, i) => i % 4 === 3 ? s : s + v, 0) / (px.length * 0.75);
+      if (avg < 8) {
+        clog('WARN', 'Чёрный экран обнаружен', { avgBrightness: avg.toFixed(2) });
+      }
+    }, 5000);
+  }
+
+  function stopBlackScreenDetector() {
+    clearInterval(blackScreenTimer);
+  }
+
+  // ── Проверка параметров ─────────────────────────────────
   if (!roomId || !token) {
     setStatus('dot-error', 'Ошибка');
     showOverlay('Неверная ссылка', 'Ссылка недействительна или была повреждена. Попросите хоста выслать новую ссылку.', false);
   } else {
     let pc;
+
+    clog('INFO', 'Зритель открыл страницу');
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${location.host}/ws?roomId=${roomId}&token=${token}&role=viewer`);
@@ -165,16 +199,20 @@
     ws.onopen = () => {
       setStatus('dot-waiting', 'Ожидание хоста...');
       showOverlay('Ожидание хоста', 'Хост должен открыть сессию и начать трансляцию экрана.');
+      clog('INFO', 'WebSocket подключён, ожидание хоста');
     };
 
     ws.onerror = () => {
       setStatus('dot-error', 'Ошибка подключения');
       showOverlay('Ошибка соединения', 'Не удалось подключиться к серверу. Проверьте ссылку и попробуйте снова.', false);
+      clog('ERROR', 'WebSocket ошибка подключения');
     };
 
     ws.onclose = (e) => {
       pc?.close();
+      stopBlackScreenDetector();
       setStatus('dot-error', 'Отключено');
+      clog('INFO', 'WebSocket закрыт', { code: e.code });
 
       if (e.code === 4001) {
         showOverlay('Доступ запрещён', 'Ссылка недействительна или истекла. Попросите хоста создать новую сессию.', false);
@@ -191,6 +229,7 @@
       if (msg.type === 'offer') {
         setStatus('dot-connecting', 'Установка соединения...');
         showOverlay('Установка соединения...', 'Настраиваем защищённый P2P канал.');
+        clog('INFO', 'Получен offer от хоста');
 
         pc = new RTCPeerConnection(ICE_CONFIG);
 
@@ -200,20 +239,28 @@
           }
         };
 
+        pc.oniceconnectionstatechange = () => {
+          clog('INFO', 'ICE состояние изменилось', { state: pc.iceConnectionState });
+        };
+
         pc.ontrack = ({ track, streams }) => {
-          // Ждём пока трек реально начнёт передавать данные
+          clog('INFO', 'Получен видео-трек', { kind: track.kind, muted: track.muted });
           track.onunmute = () => {
+            clog('INFO', 'Трек размьютирован — показываем видео');
             if (video.srcObject !== streams[0]) {
               video.srcObject = streams[0];
             }
-            video.play().catch(() => {});
+            video.play().catch((e) => clog('WARN', 'video.play() ошибка', { error: e.message }));
             showVideo();
             setStatus('dot-connected', 'Подключён');
+            startBlackScreenDetector();
           };
         };
 
         pc.onconnectionstatechange = () => {
+          clog('INFO', 'WebRTC состояние изменилось', { state: pc.connectionState });
           if (['disconnected', 'failed'].includes(pc.connectionState)) {
+            stopBlackScreenDetector();
             setStatus('dot-error', 'Соединение прервано');
             showOverlay('Соединение прервано', 'Связь с хостом была потеряна.', false);
           }
@@ -223,6 +270,7 @@
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription }));
+        clog('INFO', 'Answer отправлен хосту');
 
       } else if (msg.type === 'candidate') {
         await pc?.addIceCandidate(msg.candidate);
